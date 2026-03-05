@@ -1,0 +1,517 @@
+#!/usr/bin/env node
+
+/**
+ * Module dependencies.
+ */
+
+var app = require('../app');
+var debug = require('debug')('socket-tutorial:server');
+var http = require('http');
+const { Server } = require('socket.io');
+const { v4: uuid } = require("uuid")
+
+/**
+ * Get port from environment and store in Express.
+ */
+
+var port = normalizePort(process.env.PORT || '3000');
+app.set('port', port);
+
+/**
+ * Create HTTP server.
+ */
+
+var server = http.createServer(app);
+const io = new Server(server);
+
+/*
+========================
+IN MEMORY STORAGE
+========================
+*/
+
+const users = new Map()
+const conversations = new Map()
+const groups = new Map()
+const rooms = new Map()
+const blockedUsers = new Map()
+
+/*
+========================
+UTILS
+========================
+*/
+
+function getConversationId(a, b) {
+  return [a, b].sort().join("_")
+}
+
+function getUserList() {
+  return Array.from(users.values())
+}
+
+
+/*
+========================================
+ Socket Connection
+========================================
+*/
+
+io.on("connection", (socket) => {
+
+  const username = "User-" + socket.id.slice(0, 4)
+
+  const user = {
+    socketId: socket.id,
+    userId: uuid(),
+    username,
+    online: true,
+    status: "available",
+    lastSeen: null
+  }
+
+  users.set(socket.id, user)
+
+  socket.emit("self", user)
+  io.emit("users", getUserList())
+
+  /*
+  ========================
+  PRIVATE MESSAGE
+  ========================
+  */
+
+  socket.on("private_message", ({ to, message }) => {
+
+    const conversationId = getConversationId(socket.id, to)
+
+    const msg = {
+      id: uuid(),
+      conversationId,
+      from: socket.id,
+      to,
+      message,
+      createdAt: Date.now(),
+      status: "sent",
+      reactions: {}
+    }
+
+    if (!conversations.has(conversationId)) {
+      conversations.set(conversationId, [])
+    }
+
+    conversations.get(conversationId).push(msg)
+
+    socket.emit("message_sent", msg)
+
+    io.to(to).emit("receive_message", msg)
+  })
+
+  /*
+  ========================
+  MESSAGE HISTORY
+  ========================
+  */
+
+  socket.on("get_message_history", ({ conversationId }) => {
+
+    const messages = conversations.get(conversationId) || []
+
+    socket.emit("message_history", {
+      conversationId,
+      messages
+    })
+
+  })
+
+  /*
+  ========================
+  SEEN RECEIPT
+  ========================
+  */
+
+  socket.on("seen", ({ messageId, conversationId, to }) => {
+
+    const msgs = conversations.get(conversationId)
+
+    if (!msgs) return
+
+    const msg = msgs.find(m => m.id === messageId)
+
+    if (msg) {
+      msg.status = "read"
+    }
+
+    io.to(to).emit("message_seen", {
+      messageId,
+      seenBy: socket.id,
+      readAt: Date.now()
+    })
+
+  })
+
+  /*
+  ========================
+  EDIT MESSAGE
+  ========================
+  */
+
+  socket.on("edit_message", ({ messageId, conversationId, newMessage, to }) => {
+
+    const msgs = conversations.get(conversationId)
+
+    if (!msgs) return
+
+    const msg = msgs.find(m => m.id === messageId)
+
+    if (!msg) return
+
+    msg.message = newMessage
+    msg.edited = true
+
+    io.to(to).emit("message_edited", msg)
+    socket.emit("message_edited", msg)
+
+  })
+
+  /*
+  ========================
+  DELETE MESSAGE
+  ========================
+  */
+
+  socket.on("delete_message", ({ messageId, conversationId, to }) => {
+
+    const msgs = conversations.get(conversationId)
+
+    if (!msgs) return
+
+    const msg = msgs.find(m => m.id === messageId)
+
+    if (!msg) return
+
+    msg.deleted = true
+
+    io.to(to).emit("message_deleted", { messageId })
+    socket.emit("message_deleted", { messageId })
+
+  })
+
+  /*
+  ========================
+  REACTIONS
+  ========================
+  */
+
+  socket.on("react_to_message", ({ messageId, conversationId, emoji, to }) => {
+
+    const msgs = conversations.get(conversationId)
+
+    if (!msgs) return
+
+    const msg = msgs.find(m => m.id === messageId)
+
+    if (!msg) return
+
+    if (!msg.reactions[emoji]) msg.reactions[emoji] = []
+
+    msg.reactions[emoji].push(socket.id)
+
+    io.to(to).emit("message_reaction", {
+      messageId,
+      emoji,
+      userId: socket.id
+    })
+
+    socket.emit("message_reaction", {
+      messageId,
+      emoji,
+      userId: socket.id
+    })
+
+  })
+
+  /*
+  ========================
+  TYPING
+  ========================
+  */
+
+  socket.on("typing", ({ to }) => {
+
+    const user = users.get(socket.id)
+
+    io.to(to).emit("typing", {
+      from: socket.id,
+      username: user.username
+    })
+
+  })
+
+  socket.on("stop_typing", ({ to }) => {
+
+    io.to(to).emit("stop_typing", {
+      from: socket.id
+    })
+
+  })
+
+  /*
+  ========================
+  STATUS UPDATE
+  ========================
+  */
+
+  socket.on("update_status", ({ status }) => {
+
+    const user = users.get(socket.id)
+
+    if (!user) return
+
+    user.status = status
+
+    io.emit("user_status_updated", {
+      userId: user.userId,
+      status
+    })
+
+  })
+
+  /*
+  ========================
+  BLOCK USER
+  ========================
+  */
+
+  socket.on("block_user", ({ userId }) => {
+
+    if (!blockedUsers.has(socket.id)) {
+      blockedUsers.set(socket.id, [])
+    }
+
+    blockedUsers.get(socket.id).push(userId)
+
+    socket.emit("user_blocked", {
+      blockedUserId: userId
+    })
+
+  })
+
+  /*
+  ========================
+  GROUPS
+  ========================
+  */
+
+  socket.on("create_group", ({ groupName, members }) => {
+
+    const groupId = uuid()
+
+    const group = {
+      id: groupId,
+      name: groupName,
+      members: [socket.id, ...members],
+      messages: []
+    }
+
+    groups.set(groupId, group)
+
+    group.members.forEach(member => {
+      io.to(member).emit("group_created", {
+        groupId,
+        groupName
+      })
+    })
+
+  })
+
+  socket.on("group_message", ({ groupId, message }) => {
+
+    const group = groups.get(groupId)
+
+    if (!group) return
+
+    const msg = {
+      id: uuid(),
+      groupId,
+      from: socket.id,
+      message,
+      createdAt: Date.now()
+    }
+
+    group.messages.push(msg)
+
+    group.members.forEach(member => {
+      io.to(member).emit("group_message_received", msg)
+    })
+
+  })
+
+  socket.on("group_history", ({ groupId }) => {
+
+    const group = groups.get(groupId)
+
+    if (!group) return
+
+    socket.emit("group_history", {
+      groupId,
+      messages: group.messages
+    })
+
+  })
+
+  /*
+  ========================
+  ROOMS
+  ========================
+  */
+
+  socket.on("create_room", ({ roomName }) => {
+
+    const roomId = uuid()
+
+    const room = {
+      id: roomId,
+      name: roomName,
+      members: [],
+      messages: []
+    }
+
+    rooms.set(roomId, room)
+
+    socket.join(roomId)
+
+    room.members.push(socket.id)
+
+    io.emit("room_created", { roomId, roomName })
+
+  })
+
+  socket.on("room_message", ({ roomId, message }) => {
+
+    const room = rooms.get(roomId)
+
+    if (!room) return
+
+    const msg = {
+      id: uuid(),
+      roomId,
+      from: socket.id,
+      message,
+      createdAt: Date.now()
+    }
+
+    room.messages.push(msg)
+
+    io.to(roomId).emit("room_message_received", msg)
+
+  })
+
+  socket.on("room_history", ({ roomId }) => {
+
+    const room = rooms.get(roomId)
+
+    if (!room) return
+
+    socket.emit("room_history", {
+      roomId,
+      messages: room.messages
+    })
+
+  })
+
+  /*
+  ========================
+  DISCONNECT
+  ========================
+  */
+
+  socket.on("disconnect", () => {
+
+    const user = users.get(socket.id)
+
+    if (!user) return
+
+    user.online = false
+    user.lastSeen = Date.now()
+
+    io.emit("user_status", {
+      userId: user.userId,
+      status: "offline",
+      lastSeen: user.lastSeen
+    })
+
+    users.delete(socket.id)
+
+    io.emit("users", getUserList())
+
+  })
+
+})
+
+
+
+/**
+ * Listen on provided port, on all network interfaces.
+ */
+server.listen(port);
+server.on('error', onError);
+server.on('listening', onListening);
+
+/**
+ * Normalize a port into a number, string, or false.
+ */
+
+function normalizePort(val) {
+  var port = parseInt(val, 10);
+
+  if (isNaN(port)) {
+    // named pipe
+    return val;
+  }
+
+  if (port >= 0) {
+    // port number
+    return port;
+  }
+
+  return false;
+}
+
+/**
+ * Event listener for HTTP server "error" event.
+ */
+
+function onError(error) {
+  if (error.syscall !== 'listen') {
+    throw error;
+  }
+
+  var bind = typeof port === 'string'
+    ? 'Pipe ' + port
+    : 'Port ' + port;
+
+  // handle specific listen errors with friendly messages
+  switch (error.code) {
+    case 'EACCES':
+      console.error(bind + ' requires elevated privileges');
+      process.exit(1);
+    case 'EADDRINUSE':
+      console.error(bind + ' is already in use');
+      process.exit(1);
+    default:
+      throw error;
+  }
+}
+
+/**
+ * Event listener for HTTP server "listening" event.
+ */
+
+function onListening() {
+  var addr = server.address();
+  var bind = typeof addr === 'string'
+    ? 'pipe ' + addr
+    : 'port ' + addr.port;
+  debug('Listening on ' + bind);
+}
