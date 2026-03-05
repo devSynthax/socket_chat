@@ -97,14 +97,34 @@ io.on("connection", (socket) => {
     }
 
     if (!conversations.has(conversationId)) {
-      conversations.set(conversationId, [])
+      conversations.set(conversationId, {
+        messages: [],
+        lastMessage: null
+      })
     }
 
-    conversations.get(conversationId).push(msg)
+    const convo = conversations.get(conversationId)
+
+    convo.messages.push(msg)
+    convo.lastMessage = msg
 
     socket.emit("message_sent", msg)
 
     io.to(to).emit("receive_message", msg)
+
+    io.to(to).emit("conversation_update", {
+      conversationId,
+      from: socket.id,
+      message,
+      createdAt: msg.createdAt
+    })
+
+    socket.emit("conversation_update", {
+      conversationId,
+      from: socket.id,
+      message,
+      createdAt: msg.createdAt
+    })
   })
 
   /*
@@ -115,7 +135,8 @@ io.on("connection", (socket) => {
 
   socket.on("get_message_history", ({ conversationId }) => {
 
-    const messages = conversations.get(conversationId) || []
+    const convo = conversations.get(conversationId)
+    const messages = convo ? convo.messages : []
 
     socket.emit("message_history", {
       conversationId,

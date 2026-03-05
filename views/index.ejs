@@ -38,6 +38,57 @@
       background: var(--bg-light);
     }
 
+    .chat-main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-light);
+      overflow: hidden;
+      /* IMPORTANT */
+    }
+
+    #chatContent {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      /* IMPORTANT */
+    }
+
+    .messages-container {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      min-height: 0;
+      /* IMPORTANT for flex scrolling */
+    }
+
+    .messages-container {
+      scroll-behavior: smooth;
+    }
+
+    .sidebar {
+      width: 340px;
+      background: var(--bg-white);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      /* IMPORTANT */
+    }
+
+
+    .sidebar-content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+      min-height: 0;
+      will-change: transform;
+    }
+
     .app-container {
       display: flex;
       height: 100vh;
@@ -247,6 +298,15 @@
     .chat-item.active {
       background: rgba(102, 126, 234, 0.1);
       border-left-color: var(--primary);
+    }
+
+    .chat-item.unread .chat-name {
+      font-weight: 700;
+    }
+
+    .chat-item.unread .chat-preview {
+      font-weight: 600;
+      color: var(--text-primary);
     }
 
     .chat-avatar-small {
@@ -1263,7 +1323,11 @@
       contextConversationId: null,
       editingMessageId: null,
       forwardingMessageId: null,
-      blockingUserId: null
+      blockingUserId: null,
+      unread: {},
+      lastMessages: {},
+      lastTimes: {},
+      conversationListeners: {}
     };
 
     const emojis = ['👍', '❤️', '😆', '😮', '😢', '😡', '🎉', '🔥', '👏', '🙏', '💪', '✨', '🚀', '⭐'];
@@ -1331,17 +1395,6 @@
     });
 
     // Message Handling
-    // socket.on('receive_message', (msg) => {
-    //   if (!state.conversations[msg.conversationId]) {
-    //     state.conversations[msg.conversationId] = [];
-    //   }
-    //   state.conversations[msg.conversationId].push(msg);
-
-    //   if (state.currentChat?.socketId === msg.from) {
-    //     displayMessage(msg, false);
-    //     socket.emit('seen', { messageId: msg.id, conversationId: msg.conversationId, to: msg.from });
-    //   }
-    // });
     socket.on('receive_message', (msg) => {
       const conversationId =
         msg.conversationId ||
@@ -1365,22 +1418,25 @@
           conversationId,
           to: msg.from
         });
+
+        // Clear unread for this conversation
+        const fromUser = state.users.find(u => u.socketId === msg.from);
+        if (fromUser) {
+          state.unread[msg.from] = 0;
+        }
+      } else {
+        // Increment unread for non-open conversations
+        state.unread[msg.from] = (state.unread[msg.from] || 0) + 1;
+        // Update last message and time
+        state.lastMessages[conversationId] = msg.message;
+        state.lastTimes[conversationId] = msg.createdAt;
+        // Move chat to top
+        moveChatToTop(msg.from);
+        renderChats();
       }
     });
 
-    // socket.on('message_sent', (msg) => {
-    //   if (!state.conversations[msg.conversationId]) {
-    //     state.conversations[msg.conversationId] = [];
-    //   }
-    //   state.conversations[msg.conversationId].push(msg);
-
-    //   if (state.currentChat?.socketId === msg.to) {
-    //     displayMessage(msg, true);
-    //   }
-    // });
-
     socket.on('message_sent', (msg) => {
-
       const conversationId =
         msg.conversationId ||
         [msg.from, msg.to].sort().join('_');
@@ -1401,6 +1457,22 @@
       if (conversationId === currentConversationId) {
         displayMessage(msg, true);
       }
+
+      // Update last message and time
+      state.lastMessages[conversationId] = msg.message;
+      state.lastTimes[conversationId] = msg.createdAt;
+    });
+
+    socket.on('conversation_update', (data) => {
+      const { conversationId, from, message, createdAt } = data;
+      state.lastMessages[conversationId] = message;
+      state.lastTimes[conversationId] = createdAt;
+
+      if (!state.currentChat || state.currentChat.socketId !== from) {
+        state.unread[from] = (state.unread[from] || 0) + 1;
+        moveChatToTop(from);
+      }
+      renderChats();
     });
 
     socket.on('message_seen', ({ messageId, seenBy, readAt }) => {
@@ -1483,8 +1555,20 @@
         state.conversations[msg.groupId] = [];
       }
       state.conversations[msg.groupId].push(msg);
-      if (state.currentChat?.id === msg.groupId) {
+
+      const currentConversationId = state.currentChat?.id;
+
+      if (currentConversationId === msg.groupId) {
         displayMessage(msg, msg.from === state.self.socketId);
+      } else {
+        // Increment unread for non-open group conversations
+        state.unread[msg.groupId] = (state.unread[msg.groupId] || 0) + 1;
+        // Update last message and time
+        state.lastMessages[msg.groupId] = msg.message;
+        state.lastTimes[msg.groupId] = msg.createdAt;
+        // Move group to top
+        moveGroupToTop(msg.groupId);
+        renderChats();
       }
     });
 
@@ -1493,8 +1577,20 @@
         state.conversations[msg.roomId] = [];
       }
       state.conversations[msg.roomId].push(msg);
-      if (state.currentChat?.id === msg.roomId) {
+
+      const currentConversationId = state.currentChat?.id;
+
+      if (currentConversationId === msg.roomId) {
         displayMessage(msg, msg.from === state.self.socketId);
+      } else {
+        // Increment unread for non-open room conversations
+        state.unread[msg.roomId] = (state.unread[msg.roomId] || 0) + 1;
+        // Update last message and time
+        state.lastMessages[msg.roomId] = msg.message;
+        state.lastTimes[msg.roomId] = msg.createdAt;
+        // Move room to top
+        moveRoomToTop(msg.roomId);
+        renderChats();
       }
     });
 
@@ -1580,6 +1676,21 @@
     });
 
     // ========== UI FUNCTIONS ==========
+    function formatMessageTime(createdAt) {
+      const msgDate = new Date(createdAt);
+      const today = new Date();
+      const yesterday = new Date(today);
+      yesterday.setDate(yesterday.getDate() - 1);
+
+      if (msgDate.toDateString() === today.toDateString()) {
+        return msgDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      } else if (msgDate.toDateString() === yesterday.toDateString()) {
+        return 'Yesterday';
+      } else {
+        return msgDate.toLocaleDateString([], { month: 'short', day: 'numeric' });
+      }
+    }
+
     function renderChats() {
       elements.sidebarContent.innerHTML = '';
 
@@ -1593,7 +1704,8 @@
           online: u.online,
           status: u.status,
           type: 'user',
-          preview: u.status || 'Click to chat',
+          preview: state.lastMessages[u.socketId] || u.status || 'Click to chat',
+          time: state.lastTimes[u.socketId],
           blocked: state.blockedUsers.includes(u.userId)
         }));
       } else if (state.currentTab === 'groups') {
@@ -1601,14 +1713,16 @@
           id: g.id,
           name: g.name,
           type: 'group',
-          preview: `${g.members.length} members`
+          preview: state.lastMessages[g.id] || `${g.members.length} members`,
+          time: state.lastTimes[g.id]
         }));
       } else if (state.currentTab === 'rooms') {
         items = state.rooms.map(r => ({
           id: r.id,
           name: r.name,
           type: 'room',
-          preview: `${r.memberCount} members`
+          preview: state.lastMessages[r.id] || `${r.memberCount} members`,
+          time: state.lastTimes[r.id]
         }));
       }
 
@@ -1623,10 +1737,13 @@
 
       filtered.forEach(item => {
         const div = document.createElement('div');
-        div.className = 'chat-item' + (state.currentChat?.id === item.id ? ' active' : '');
+        const isUnread = state.unread[item.socketId] || state.unread[item.id];
+        div.className = 'chat-item' + (state.currentChat?.id === item.id ? ' active' : '') + (isUnread ? ' unread' : '');
 
         const initials = getInitials(item.name);
         const statusClass = item.online ? 'online' : '';
+
+        const timeStr = item.time ? formatMessageTime(item.time) : '';
 
         div.innerHTML = `
           <div class="chat-avatar-small ${statusClass}">
@@ -1637,10 +1754,16 @@
           <div class="chat-details">
             <div class="chat-name">
               ${item.name}
+              ${isUnread ? `<span class="unread-badge">${isUnread}</span>` : ''}
               ${item.blocked ? '<span class="chat-badge" style="background: var(--danger);">BLOCKED</span>' : ''}
               ${item.type !== 'user' ? `<span class="chat-badge">${item.type.toUpperCase()}</span>` : ''}
             </div>
-            <div class="chat-preview">${item.preview}</div>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <div class="chat-preview">
+                ${item.preview}
+              </div>
+              ${timeStr ? `<span class="chat-time">${timeStr}</span>` : ''}
+            </div>
           </div>
         `;
 
@@ -1656,6 +1779,13 @@
     }
 
     function openChat(item) {
+      // Clear unread badge for this chat
+      if (item.socketId) {
+        state.unread[item.socketId] = 0;
+      } else {
+        state.unread[item.id] = 0;
+      }
+      
       state.currentChat = item;
       elements.emptyState.style.display = 'none';
       elements.chatContent.style.display = 'flex';
@@ -1682,12 +1812,31 @@
         });
       }
 
-      renderChats();
+      // Remove old listener if exists
+      if (state.conversationListeners[conversationId]) {
+        socket.off('conversation_update', state.conversationListeners[conversationId]);
+      }
+
+      // Add new listener for this conversation
+      const listener = (data) => {
+        const { conversationId: dataConvId, from, message } = data;
+        if (dataConvId === conversationId) {
+          state.lastMessages[dataConvId] = message;
+          if (!state.currentChat || state.currentChat.socketId !== from) {
+            state.unread[from] = (state.unread[from] || 0) + 1;
+            moveChatToTop(from);
+          }
+          renderChats();
+        }
+      };
+      state.conversationListeners[conversationId] = listener;
+      socket.on('conversation_update', listener);
 
       if (window.innerWidth < 768) {
         elements.sidebar.classList.add('mobile-show');
       }
 
+      renderChats();
       elements.messageInput.focus();
     }
 
@@ -1897,6 +2046,30 @@
 
     function closeModal(id) {
       document.getElementById(id).classList.remove('active');
+    }
+
+    function moveChatToTop(socketId) {
+      const index = state.users.findIndex(u => u.socketId === socketId);
+      if (index > -1) {
+        const user = state.users.splice(index, 1)[0];
+        state.users.unshift(user);
+      }
+    }
+
+    function moveGroupToTop(groupId) {
+      const index = state.groups.findIndex(g => g.id === groupId);
+      if (index > -1) {
+        const group = state.groups.splice(index, 1)[0];
+        state.groups.unshift(group);
+      }
+    }
+
+    function moveRoomToTop(roomId) {
+      const index = state.rooms.findIndex(r => r.id === roomId);
+      if (index > -1) {
+        const room = state.rooms.splice(index, 1)[0];
+        state.rooms.unshift(room);
+      }
     }
 
     // ========== EVENT LISTENERS ==========
